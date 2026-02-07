@@ -346,50 +346,157 @@
             const file = event.target.files[0];
             if (!file) return;
             
+            // まずShift_JISで試す
             const reader = new FileReader();
             reader.onload = function(e) {
-                const text = e.target.result;
-                const lines = text.split('\n').filter(line => line.trim());
+                let text = e.target.result;
                 
-                if (lines.length < 2) {
-                    alert('❌ CSVファイルが空です');
-                    return;
+                // Shift_JISで読めたか確認（文字化けチェック）
+                if (text.includes('�') || !text.includes('約定日')) {
+                    // Shift_JISで失敗した場合、UTF-8で再試行
+                    const utf8Reader = new FileReader();
+                    utf8Reader.onload = function(e2) {
+                        processCSV(e2.target.result);
+                    };
+                    utf8Reader.onerror = function() {
+                        alert('❌ ファイルの読み込みに失敗しました');
+                    };
+                    utf8Reader.readAsText(file, 'UTF-8');
+                } else {
+                    processCSV(text);
                 }
-                
-                const headers = lines[0].split(',').map(h => h.trim());
-                const dateIndex = headers.findIndex(h => h.includes('日付') || h.includes('年月日'));
-                const nameIndex = headers.findIndex(h => h.includes('銘柄') || h.includes('名称'));
-                const profitIndex = headers.findIndex(h => h.includes('損益') || h.includes('利益'));
-                
-                if (dateIndex === -1 || nameIndex === -1 || profitIndex === -1) {
-                    alert('❌ 必要な列が見つかりません\n必要: 日付、銘柄名、損益');
-                    return;
-                }
-                
-                const newTrades = [];
-                for (let i = 1; i < lines.length; i++) {
-                    const cols = lines[i].split(',').map(c => c.trim());
-                    if (cols.length < 3) continue;
-                    
-                    const profit = parseInt(cols[profitIndex].replace(/[^\d-]/g, ''));
-                    if (isNaN(profit)) continue;
-                    
-                    newTrades.push({
-                        date: cols[dateIndex],
-                        name: cols[nameIndex],
-                        profit: profit,
-                        method: null,
-                        hasLowerWick: false,
-                        testProfit: null
-                    });
-                }
-                
-                savedTrades.push(...newTrades);
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
-                displayTrades();
-                alert(`✅ ${newTrades.length}件のトレードを読み込みました`);
             };
-            reader.readAsText(file);
+            reader.onerror = function() {
+                // Shift_JISで失敗した場合、UTF-8で試す
+                const utf8Reader = new FileReader();
+                utf8Reader.onload = function(e) {
+                    processCSV(e.target.result);
+                };
+                utf8Reader.onerror = function() {
+                    alert('❌ ファイルの読み込みに失敗しました');
+                };
+                utf8Reader.readAsText(file, 'UTF-8');
+            };
+            reader.readAsText(file, 'Shift_JIS');
+        }
+
+        function processCSV(text) {
+            const lines = text.split('\n');
+            const rawTrades = [];
+            
+            // ヘッダー行を探す
+            let dataStartIndex = 0;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes('約定日') && lines[i].includes('銘柄')) {
+                    dataStartIndex = i + 1;
+                    break;
+                }
+            }
+            
+            if (dataStartIndex === 0) {
+                alert('❌ ヘッダー行が見つかりません\nCSVファイルに「約定日」と「銘柄」列が必要です');
+                return;
+            }
+            
+            // 全トレードを読み込む
+            for (let i = dataStartIndex; i < lines.length; i++) {
+                if (!lines[i].trim()) continue;
+                const cols = lines[i].split(',');
+                if (cols.length < 14) continue;
+                
+                const date = cols[0].replace(/"/g, '').trim();
+                const name = cols[1].replace(/"/g, '').trim();
+                const code = cols[2].replace(/"/g, '').trim();
+                const type = cols[4].replace(/"/g, '').trim(); // 取引種類（買/売）
+                const qty = parseInt(cols[8].replace(/"/g, '').trim());
+                const prc = parseFloat(cols[9].replace(/"/g, '').trim());
+                const amt = parseInt(cols[13].replace(/"/g, '').trim()); // 受渡金額
+                
+                if (!date || !name || !code || !type || isNaN(qty) || isNaN(prc) || isNaN(amt)) continue;
+                
+                rawTrades.push({date, name, code, type, quantity: qty, price: prc, amount: amt});
+            }
+            
+            if (rawTrades.length === 0) {
+                alert('❌ トレードデータが見つかりませんでした');
+                return;
+            }
+            
+            // 日付ごとにグループ化
+            const tradesByDate = {};
+            rawTrades.forEach(trade => {
+                if (!tradesByDate[trade.date]) tradesByDate[trade.date] = [];
+                tradesByDate[trade.date].push(trade);
+            });
+            
+            // 買いと売りをペアリング
+            const newTrades = [];
+            Object.entries(tradesByDate).forEach(([date, dayTrades]) => {
+                const buys = dayTrades.filter(t => t.type.includes('買'));
+                const sells = dayTrades.filter(t => t.type.includes('売'));
+                
+                // 銘柄コードごとにグループ化
+                const stockMap = {};
+                buys.forEach(buy => {
+                    if (!stockMap[buy.code]) stockMap[buy.code] = {buys: [], sells: []};
+                    stockMap[buy.code].buys.push(buy);
+                });
+                sells.forEach(sell => {
+                    if (!stockMap[sell.code]) stockMap[sell.code] = {buys: [], sells: []};
+                    stockMap[sell.code].sells.push(sell);
+                });
+                
+                // ペアリング
+                Object.entries(stockMap).forEach(([code, data]) => {
+                    const pairCount = Math.min(data.buys.length, data.sells.length);
+                    for (let i = 0; i < pairCount; i++) {
+                        const buy = data.buys[i];
+                        const sell = data.sells[i];
+                        const profit = Math.round(sell.amount - buy.amount);
+                        
+                        newTrades.push({
+                            date: date,
+                            name: buy.name,
+                            profit: profit,
+                            method: null,
+                            hasLowerWick: false,
+                            testProfit: null
+                        });
+                    }
+                });
+            });
+            
+            if (newTrades.length === 0) {
+                alert('❌ 売買ペアが成立しませんでした\n同じ日に買いと売りが必要です');
+                return;
+            }
+            
+            savedTrades.push(...newTrades);
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
+            displayTrades();
+            alert(`✅ ${newTrades.length}件のトレードを読み込みました`);
+        }
+
+        function parseCSVLine(line) {
+            const result = [];
+            let current = '';
+            let inQuotes = false;
+            
+            for (let i = 0; i < line.length; i++) {
+                const char = line[i];
+                
+                if (char === '"') {
+                    inQuotes = !inQuotes;
+                } else if (char === ',' && !inQuotes) {
+                    result.push(current.trim());
+                    current = '';
+                } else {
+                    current += char;
+                }
+            }
+            result.push(current.trim());
+            
+            return result;
         }
 
         function loadSavedTrades() {
@@ -430,30 +537,58 @@
             const list = document.getElementById('tradeList');
             list.innerHTML = '';
             
+            // 重複検出（同日・同銘柄の完成トレード数をカウント）
+            // 重要: CSVの行数ではなく、ペアリング後のトレード数で判定
+            const duplicateMap = {};
+            savedTrades.forEach(trade => {
+                const key = `${trade.date}_${trade.name}`;
+                duplicateMap[key] = (duplicateMap[key] || 0) + 1;
+            });
+            
             let totalProfit = 0;
             let wins = 0;
             
             filteredTrades.forEach((trade, index) => {
-                totalProfit += trade.profit;
-                if (trade.profit > 0) wins++;
+                // 実際のインデックスを取得（フィルタリング後ではなく元の配列での位置）
+                const actualIndex = savedTrades.indexOf(trade);
+                
+                // 修正された損益を使用（なければ元の損益）
+                const actualProfit = trade.correctedProfit !== undefined ? trade.correctedProfit : trade.profit;
+                totalProfit += actualProfit;
+                if (actualProfit > 0) wins++;
                 
                 const div = document.createElement('div');
-                const profitClass = trade.profit > 0 ? 'profit' : trade.profit < 0 ? 'loss' : 'zero';
+                const profitClass = actualProfit > 0 ? 'profit' : actualProfit < 0 ? 'loss' : 'zero';
                 div.className = `trade-item ${profitClass}`;
                 
+                // 重複チェック（ペアリング後のトレードが2回以上 = 真の重複）
+                const key = `${trade.date}_${trade.name}`;
+                const isDuplicate = duplicateMap[key] >= 2;
+                
                 const methodSelect = `
-                    <select onchange="updateMethod(${index}, this.value)">
+                    <select onchange="updateMethod(${actualIndex}, this.value)">
                         <option value="">手法を選択</option>
                         ${methods.map(m => `<option value="${m}" ${trade.method === m ? 'selected' : ''}>${m}</option>`).join('')}
                     </select>
                 `;
                 
+                // 重複時のみ実収支修正欄を表示
+                const duplicateWarning = isDuplicate ? '<div style="color: #e67e22; font-weight: bold; margin-top: 5px;">⚠️ 同一銘柄2回以上検出</div>' : '';
+                const realProfitInput = isDuplicate ? `
+                    <div style="background: #ffe6cc; padding: 10px; border-radius: 5px; margin-top: 10px;">
+                        <label style="font-size: 0.9em; display: block; margin-bottom: 5px;">実収支を修正(正しければそのまま)</label>
+                        <input type="number" class="test-profit-input" id="realProfit${actualIndex}" 
+                               value="${actualProfit}" 
+                               onchange="updateRealProfit(${actualIndex}, this.value)">
+                    </div>
+                ` : '';
+                
                 const testProfitSection = `
                     <div class="test-profit-section">
                         <label style="font-size: 0.9em; color: #856404;">検証損益:</label>
                         <input type="number" class="test-profit-input" value="${trade.testProfit || ''}" 
-                               onchange="updateTestProfit(${index}, this.value)" placeholder="円">
-                        <button class="copy-profit-btn" onclick="copyProfit(${index})">実損益コピー</button>
+                               onchange="updateTestProfit(${actualIndex}, this.value)" placeholder="円">
+                        <button class="copy-profit-btn" onclick="copyProfit(${actualIndex})">実損益コピー</button>
                     </div>
                 `;
                 
@@ -462,17 +597,19 @@
                         <div class="trade-date">${trade.date}</div>
                         <div class="trade-name">${trade.name}</div>
                         <div class="trade-detail">手法: ${trade.method || '未設定'}</div>
+                        ${duplicateWarning}
                     </div>
                     <div class="trade-controls">
                         <div class="trade-amount ${profitClass}">
-                            ${trade.profit > 0 ? '+' : ''}${trade.profit.toLocaleString()}円
+                            ${isDuplicate ? '自動計算: ' : ''}${actualProfit > 0 ? '+' : ''}${actualProfit.toLocaleString()}円
                         </div>
                         ${methodSelect}
                         <label class="checkbox-label">
                             <input type="checkbox" ${trade.hasLowerWick ? 'checked' : ''} 
-                                   onchange="updateWick(${index}, this.checked)">
+                                   onchange="updateWick(${actualIndex}, this.checked)">
                             <span>下ヒゲあり</span>
                         </label>
+                        ${realProfitInput}
                         ${testProfitSection}
                     </div>
                 `;
@@ -499,13 +636,22 @@
             localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
         }
 
+        function updateRealProfit(index, value) {
+            savedTrades[index].correctedProfit = value ? parseInt(value) : undefined;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
+            displayTrades();
+        }
+
         function updateTestProfit(index, value) {
             savedTrades[index].testProfit = value ? parseInt(value) : null;
             localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
         }
 
         function copyProfit(index) {
-            savedTrades[index].testProfit = savedTrades[index].profit;
+            const actualProfit = savedTrades[index].correctedProfit !== undefined ? 
+                                savedTrades[index].correctedProfit : 
+                                savedTrades[index].profit;
+            savedTrades[index].testProfit = actualProfit;
             localStorage.setItem(STORAGE_KEY, JSON.stringify(savedTrades));
             displayTrades();
         }
@@ -529,9 +675,10 @@
                 filteredTrades.forEach(trade => {
                     if (!trade.method) return;
                     if (!methodMap[trade.method]) methodMap[trade.method] = {count: 0, profit: 0, wins: 0};
+                    const actualProfit = trade.correctedProfit !== undefined ? trade.correctedProfit : trade.profit;
                     methodMap[trade.method].count++;
-                    methodMap[trade.method].profit += trade.profit;
-                    if (trade.profit > 0) methodMap[trade.method].wins++;
+                    methodMap[trade.method].profit += actualProfit;
+                    if (actualProfit > 0) methodMap[trade.method].wins++;
                 });
                 
                 let totalCount = 0, totalProfit = 0, totalWins = 0;
@@ -564,9 +711,11 @@
             } else if (currentStatsTab === 'real-special') {
                 const wickStats = {withWick: {count: 0, profit: 0, wins: 0}, withoutWick: {count: 0, profit: 0, wins: 0}};
                 filteredTrades.forEach(trade => {
+                    const actualProfit = trade.correctedProfit !== undefined ? trade.correctedProfit : trade.profit;
                     const key = trade.hasLowerWick ? 'withWick' : 'withoutWick';
-                    wickStats[key].count++; wickStats[key].profit += trade.profit;
-                    if (trade.profit > 0) wickStats[key].wins++;
+                    wickStats[key].count++; 
+                    wickStats[key].profit += actualProfit;
+                    if (actualProfit > 0) wickStats[key].wins++;
                 });
                 
                 let totalCount = 0, totalProfit = 0, totalWins = 0;
@@ -682,17 +831,30 @@
             });
             let postText = '【今週のトレード結果】\n\n';
             Object.entries(dateMap).forEach(([date, dayTrades]) => {
-                const dayProfit = dayTrades.reduce((sum, t) => sum + t.profit, 0);
+                const dayProfit = dayTrades.reduce((sum, t) => {
+                    const actualProfit = t.correctedProfit !== undefined ? t.correctedProfit : t.profit;
+                    return sum + actualProfit;
+                }, 0);
                 postText += `${date}\n`;
                 dayTrades.forEach(trade => {
-                    const sign = trade.profit > 0 ? '+' : '';
-                    postText += `・${trade.name}(${trade.method || '未設定'}) ${sign}${trade.profit.toLocaleString()}円\n`;
+                    const actualProfit = trade.correctedProfit !== undefined ? trade.correctedProfit : trade.profit;
+                    const sign = actualProfit > 0 ? '+' : '';
+                    postText += `・${trade.name}(${trade.method || '未設定'}) ${sign}${actualProfit.toLocaleString()}円\n`;
                 });
                 const daySign = dayProfit > 0 ? '+' : '';
                 postText += `→ 日次: ${daySign}${dayProfit.toLocaleString()}円\n\n`;
             });
-            const totalProfit = savedTrades.reduce((sum, t) => sum + t.profit, 0);
-            const winDays = Object.values(dateMap).filter(trades => trades.reduce((sum, t) => sum + t.profit, 0) > 0).length;
+            const totalProfit = savedTrades.reduce((sum, t) => {
+                const actualProfit = t.correctedProfit !== undefined ? t.correctedProfit : t.profit;
+                return sum + actualProfit;
+            }, 0);
+            const winDays = Object.values(dateMap).filter(trades => {
+                const dayProfit = trades.reduce((sum, t) => {
+                    const actualProfit = t.correctedProfit !== undefined ? t.correctedProfit : t.profit;
+                    return sum + actualProfit;
+                }, 0);
+                return dayProfit > 0;
+            }).length;
             const totalDays = Object.keys(dateMap).length;
             postText += `今週合計: ${totalProfit > 0 ? '+' : ''}${totalProfit.toLocaleString()}円\n`;
             postText += `勝率: ${winDays}/${totalDays}日 (${(winDays/totalDays*100).toFixed(1)}%)\n\n`;
